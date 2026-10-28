@@ -20,6 +20,7 @@ To scan an edge IP, you must pass an SNI and `Host` header that the target CDN's
 | :--- | :--- | :--- | :--- |
 | **Cloudflare** | `https://www.cloudflare.com/ips-v4` | `speed.cloudflare.com` or `cloudflare.com` | `/__down?bytes=1000` or `/cdn-cgi/trace` |
 | **Fastly** | `https://api.fastly.com/public-ip-list` | `fastly.com` or `www.github.com` | `/` |
+| **ArvanCloud** | `https://www.arvancloud.ir/en/ips.txt` | Your own domain proxied through ArvanCloud | `/` (any path on your domain) |
 
 ---
 
@@ -212,6 +213,155 @@ func main() {
 	}
 }
 ```
+
+---
+
+### 1.4 ArvanCloud Edge Scanner (VPS Domain via ArvanEdge)
+
+ArvanCloud is a domestic Iranian CDN, so its edge nodes usually stay reachable during international blockades. If your VPS domain is added to ArvanCloud with the CDN proxy enabled (DNS record pointing to the VPS origin), you can connect to any reachable Arvan edge IP using **your own domain** as SNI and `Host`, and the edge forwards traffic to your VPS.
+
+Unlike Cloudflare and Fastly, Arvan publishes many small ranges (`/27`–`/30`), so this scanner tests **every host** in each range instead of sampling one IP per `/24`. Pass your domain with `-domain`; an IP is clean when it completes TLS for your domain and the response carries ArvanCloud's `Server` header.
+
+> **Caveat:** ArvanCloud terminates TLS inside Iran, so the edge can see your decrypted traffic (see section 4). Run an inner encrypted protocol (e.g. VLESS or Trojan over WebSocket/gRPC) through it rather than plain HTTP.
+
+```go
+package main
+
+import (
+	"crypto/tls"
+	"flag"
+	"fmt"
+	"net"
+	"net/netip"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Source: https://www.arvancloud.ir/en/ips.txt (fetched 2026-10-28)
+var arvanCIDRs = []string{
+	"185.143.232.0/22",
+	"188.229.116.16/30",
+	"94.101.182.0/27",
+	"2.144.3.128/28",
+	"37.32.16.0/27",
+	"37.32.17.0/27",
+	"37.32.18.0/27",
+	"37.32.19.0/27",
+	"185.215.232.0/22",
+	"178.131.120.48/28",
+	"94.101.183.0/28",
+	"78.157.36.112/28",
+	"95.38.61.80/28",
+	"193.24.119.0/29",
+}
+
+const (
+	timeout    = 2 * time.Second
+	maxWorkers = 64
+)
+
+type result struct {
+	IP    string
+	TCPms float64
+	TLSms float64
+}
+
+// scanArvanIP connects to an edge IP using the VPS domain as SNI/Host and checks
+// that the response was served by ArvanCloud.
+func scanArvanIP(ip, domain, path string) (*result, bool) {
+	start := time.Now()
+
+	rawConn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, "443"), timeout)
+	if err != nil {
+		return nil, false
+	}
+	tcpRTT := float64(time.Since(start).Microseconds()) / 1000
+	_ = rawConn.SetDeadline(time.Now().Add(timeout))
+
+	tlsConn := tls.Client(rawConn, &tls.Config{ServerName: domain})
+	defer tlsConn.Close()
+	if err := tlsConn.Handshake(); err != nil {
+		return nil, false
+	}
+	tlsRTT := float64(time.Since(start).Microseconds()) / 1000
+
+	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: EdgeProbe/2.0\r\nConnection: close\r\n\r\n", path, domain)
+	if _, err := tlsConn.Write([]byte(req)); err != nil {
+		return nil, false
+	}
+	buf := make([]byte, 1024)
+	n, _ := tlsConn.Read(buf)
+	data := strings.ToLower(string(buf[:n]))
+
+	if strings.HasPrefix(data, "http/1.1 ") && strings.Contains(data, "server: arvancloud") {
+		return &result{IP: ip, TCPms: tcpRTT, TLSms: tlsRTT}, true
+	}
+	return nil, false
+}
+
+func main() {
+	domain := flag.String("domain", "", "your VPS domain proxied through ArvanCloud (required)")
+	path := flag.String("path", "/", "request path on your domain")
+	flag.Parse()
+	if *domain == "" {
+		fmt.Println("usage: arvanscan -domain vpn.example.com [-path /]")
+		return
+	}
+
+	// Enumerate every usable host in each range (ranges are small)
+	var scanIPs []string
+	for _, cidr := range arvanCIDRs {
+		prefix := netip.MustParsePrefix(cidr).Masked()
+		for addr := prefix.Addr().Next(); prefix.Contains(addr.Next()); addr = addr.Next() {
+			scanIPs = append(scanIPs, addr.String())
+		}
+	}
+
+	fmt.Printf("[*] Scanning %d ArvanCloud edge IPs against %s...\n", len(scanIPs), *domain)
+
+	jobs := make(chan string)
+	results := make(chan *result)
+	var wg sync.WaitGroup
+	for w := 0; w < maxWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for ip := range jobs {
+				if r, ok := scanArvanIP(ip, *domain, *path); ok {
+					results <- r
+				}
+			}
+		}()
+	}
+	go func() {
+		for _, ip := range scanIPs {
+			jobs <- ip
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+
+	var clean []*result
+	for r := range results {
+		fmt.Printf("[+] CLEAN: %-16s | TCP: %5.1fms | TLS: %5.1fms\n", r.IP, r.TCPms, r.TLSms)
+		clean = append(clean, r)
+	}
+
+	sort.Slice(clean, func(i, j int) bool { return clean[i].TLSms < clean[j].TLSms })
+	fmt.Println("\n--- TOP CLEAN ARVAN EDGE NODES ---")
+	for i, r := range clean {
+		if i == 10 {
+			break
+		}
+		fmt.Printf("%s\t(Total RTT: %.1fms)\n", r.IP, r.TLSms)
+	}
+}
+```
+
+Use the fastest clean IP as the client's server address while keeping your domain as SNI/`Host` in the client config (e.g. Xray/V2Ray `address: <clean IP>`, `serverName`/`host: <your domain>`).
 
 ---
 
